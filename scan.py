@@ -1,236 +1,313 @@
-#!/usr/bin/env python3
-"""
-MiniCar 巡线与二维码识别系统
------------------------------------------
-功能：
-* 优先巡黑色线，丢线时启用容错策略
-* 检测到红色车道线时触发减速，切换保守PID参数
-* 仅在红色线区域激活二维码识别，减少资源占用
-* 支持透视变换增强二维码解码准确率
-"""
-
-import os
+import serial
+import struct
+import argparse
 import time
 import cv2
 import numpy as np
-import concurrent.futures as futures
 from pyzbar import pyzbar
 
-# ──────────────── 配置参数 ────────────────
-# 摄像头参数
-CAM_DEVICE = int(os.getenv("CAM_DEVICE", 0))
-CAM_WIDTH = int(os.getenv("CAM_WIDTH", 320))
-CAM_HEIGHT = int(os.getenv("CAM_HEIGHT", 240))
-CAM_FPS = int(os.getenv("CAM_FPS", 30))
+# 协议常量
+FRAME_HEADER = 0x7B
+FRAME_TAIL = 0x7D
 
-# 巡线参数（黑色线）
-BLACK_LOW = np.array([0, 0, 0])
-BLACK_HIGH = np.array([180, 255, 30])
-LINE_REGION_Y = 180  # 巡线检测区域Y坐标（ROI）
+# 角度环 PID 参数
+Kp_angle = 0.0018
+Ki_angle = 0.00005
+Kd_angle = 0.0007
 
-# 红色线检测参数
-RED_LOW1 = np.array([0, 100, 100])
-RED_HIGH1 = np.array([10, 255, 255])
-RED_LOW2 = np.array([160, 100, 100])
-RED_HIGH2 = np.array([180, 255, 255])
-RED_DETECT_THRESH = 50  # 红色像素阈值
+# 速度环 PID 参数
+Kp_speed = 0.0025  # 速度比例系数
+Ki_speed = 0.00005  # 速度积分系数
+Kd_speed = 0.00005  # 速度微分系数
 
-# PID参数（Kp, Ki, Kd）
-NORMAL_PID = (0.8, 0.01, 0.2)     # 正常巡线PID
-CONSERVATIVE_PID = (0.5, 0.005, 0.1)  # 保守模式PID
+# 积分和上一次误差
+integral_angle = 0
+previous_error_angle = 0
+integral_speed = 0
+previous_error_speed = 0
 
-# 二维码识别参数
-QR_THREADS = 2
-WARP_SIZE = 200
-QR_ENABLE_DIST = 100  # 红色线距离阈值时启用二维码
+MAX_ANGULAR_SPEED = 4.0  # 最大角速度 (rad/s)
 
-# 车辆控制参数
-MAX_SPEED = 60
-DECEL_SPEED = 30      # 红色线减速后的速度
-LOST_LINE_SPEED = 20  # 丢线时速度
+def build_frame(vx: float, vy: float, vz: float) -> bytes:
+    """构造14字节帧：[HEADER(1)] [vx(4)] [vy(4)] [vz(4)] [TAIL(1)]"""
+    frame = bytearray()
+    frame.append(FRAME_HEADER)
+    frame += struct.pack('<f', vx)
+    frame += struct.pack('<f', vy)
+    frame += struct.pack('<f', vz)
+    frame.append(FRAME_TAIL)
+    return bytes(frame)
 
-# ──────────────── 初始化组件 ────────────────
-# 摄像头
-cap = cv2.VideoCapture(CAM_DEVICE)
-if not cap.isOpened():
-    raise RuntimeError("无法打开摄像头")
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-cap.set(cv2.CAP_PROP_FPS, CAM_FPS)
+# ───────── 摄像头 & 推流参数 ─────────
+DEVICE = 0
+TARGET_W = 1280
+TARGET_H = 720
+TARGET_FPS = 30
+JPEG_QUALITY = 70
 
-# 线程池
-executor = futures.ThreadPoolExecutor(max_workers=QR_THREADS)
+# ───────── 车道线算法参数 ─────────
+ROI_RATIO = 0.7   # 0.5 = 下半幅
+NUM_SLICES = 6
+VALID_AREA = 1000      # 最小有效面积
+MAX_VALID_AREA = 15000  # 新增：最大有效面积
+HSV_LOWER = np.array([0, 0, 0], np.uint8)
+HSV_UPPER = np.array([180, 255, 60], np.uint8)
+KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-# 状态变量
-in_red_zone = False         # 是否处于红色线区域
-last_line_pos = CAM_WIDTH // 2  # 上次黑线位置
-lost_line_count = 0         # 丢线计数
-current_pid = NORMAL_PID    # 当前PID参数
-current_speed = MAX_SPEED   # 当前车速
+# ───────── 速度环控制参数 ─────────
+MAX_SPEED = 0.6  # 最大速度 (m/s)
+MIN_SPEED = 0.001  # 最小速度 (m/s)
+ANGLE_THRESHOLD = 0.5  # 角度阈值，用于速度调节
 
-# ──────────────── 工具函数 ────────────────
-def detect_black_line(frame):
-    """检测黑色线位置，返回中线偏移量（正值右偏，负值左偏）"""
-    # 提取ROI区域
-    roi = frame[LINE_REGION_Y:, :]
-    h, w = roi.shape[:2]
+# ───────── 初始化摄像头 ─────────
+cap = None
+
+def initialize_camera():
+    """初始化摄像头并返回摄像头对象"""
+    global cap
+    cap = cv2.VideoCapture(DEVICE, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        raise RuntimeError("无法打开摄像头")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, TARGET_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_H)
+    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
-    # 二值化黑色线
-    mask = cv2.inRange(roi, BLACK_LOW, BLACK_HIGH)
-    # 计算轮廓矩
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return None  # 未检测到黑线
-    
-    # 取最大轮廓
-    largest_contour = max(contours, key=cv2.contourArea)
-    M = cv2.moments(largest_contour)
-    
-    if M["m00"] == 0:
-        return None
-    
-    # 计算中心点
-    cx = int(M["m10"] / M["m00"])
-    line_pos = cx - (w // 2)  # 相对于中线的偏移量
-    return line_pos
+    src_w, src_h = int(cap.get(3)), int(cap.get(4))
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    print(f"Camera native {src_w}×{src_h}  {src_fps:.1f} FPS")
+    return cap
 
-def detect_red_line(frame):
-    """检测红色线，返回是否存在及红色区域强度"""
-    # 转换到HSV色彩空间
+# ───────── 车道线检测 ─────────
+def detect_lane(frame):
+    h, w = frame.shape[:2]
+    roi_y0 = int(h * (1 - ROI_RATIO))
+    slice_h = (h - roi_y0) // NUM_SLICES
+
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    # 红色在HSV中的两个区间（0-10和160-180）
-    mask1 = cv2.inRange(hsv, RED_LOW1, RED_HIGH1)
-    mask2 = cv2.inRange(hsv, RED_LOW2, RED_HIGH2)
-    mask = cv2.bitwise_or(mask1, mask2)
-    
-    # 计算红色像素数量
-    red_pixels = cv2.countNonZero(mask)
-    # 仅检测下半部分区域（避免背景干扰）
-    roi = mask[LINE_REGION_Y:, :]
-    red_roi_pixels = cv2.countNonZero(roi)
-    
-    # 判断是否处于红色区域
-    is_red = red_roi_pixels > RED_DETECT_THRESH
-    return is_red, red_roi_pixels
+    mask = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL, 1)
+    mask = cv2.dilate(mask, KERNEL, 1)
 
-def perspective_transform(image, points):
-    """对二维码区域进行透视变换"""
-    pts = np.array([
-        (points[0].x, points[0].y),
-        (points[1].x, points[1].y),
-        (points[2].x, points[2].y),
-        (points[3].x, points[3].y)
-    ], dtype=np.float32)
-    
-    dst = np.array([
-        [0, 0],
-        [WARP_SIZE - 1, 0],
-        [WARP_SIZE - 1, WARP_SIZE - 1],
-        [0, WARP_SIZE - 1]
-    ], dtype=np.float32)
-    
-    M = cv2.getPerspectiveTransform(pts, dst)
-    return cv2.warpPerspective(image, M, (WARP_SIZE, WARP_SIZE))
+    center_x = 0
+    valid_count = 0
+    for i in range(NUM_SLICES):
+        y1 = roi_y0 + i * slice_h
+        y2 = h if i == NUM_SLICES - 1 else roi_y0 + (i + 1) * slice_h
+        slice_mask = mask[y1:y2]
 
-def decode_qr_code(gray_frame):
-    """解码二维码，返回解码内容"""
-    decoded = executor.submit(pyzbar.decode, gray_frame).result()
-    valid_codes = []
-    for obj in decoded:
-        if len(obj.polygon) == 4:
-            # 透视变换增强解码
-            warped = perspective_transform(gray_frame, obj.polygon)
-            warped = cv2.equalizeHist(warped)
-            warped_decoded = executor.submit(pyzbar.decode, warped).result()
-            if warped_decoded and warped_decoded[0].data:
-                valid_codes.append(warped_decoded[0].data.decode("utf-8", "ignore"))
-    return valid_codes if valid_codes else None
-
-# ──────────────── 车辆控制逻辑 ────────────────
-def update_control(line_pos, red_strength):
-    """根据线位置和红色强度更新车辆控制参数"""
-    global in_red_zone, last_line_pos, lost_line_count
-    global current_pid, current_speed
-    
-    # 1. 处理红色线检测
-    if red_strength > QR_ENABLE_DIST:
-        in_red_zone = True
-        current_speed = DECEL_SPEED
-        current_pid = CONSERVATIVE_PID
-    else:
-        in_red_zone = False
-        current_speed = MAX_SPEED
-        current_pid = NORMAL_PID
-    
-    # 2. 处理黑线检测结果
-    if line_pos is not None:
-        # 检测到黑线，重置丢线计数
-        lost_line_count = 0
-        last_line_pos = line_pos
-    else:
-        # 丢线处理
-        lost_line_count += 1
-        if lost_line_count < 5:
-            # 短时间丢线，使用上次位置
-            line_pos = last_line_pos
-        else:
-            # 长时间丢线，减速并启用保守策略
-            current_speed = LOST_LINE_SPEED
-            line_pos = 0  # 假设中线位置
-    
-    # 3. PID计算转向（简化示例，实际需对接电机控制）
-    kp, ki, kd = current_pid
-    steering = kp * line_pos
-    print(f"车速: {current_speed}, 转向: {steering:.1f}, "
-          f"红线强度: {red_strength}, 丢线计数: {lost_line_count}")
-    
-    # （此处应添加实际电机控制代码）
-    return current_speed, steering
-
-# ──────────────── 主循环 ────────────────
-def main_loop():
-    """系统主循环：巡线+二维码识别"""
-    print("系统启动，开始巡线...")
-    last_qr_time = 0
-    
-    while True:
-        t_start = time.time()
-        ok, frame = cap.read()
-        if not ok:
-            time.sleep(0.1)
+        cnts, _ = cv2.findContours(slice_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
             continue
+        largest = max(cnts, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
         
-        # 1. 检测黑色线
-        line_pos = detect_black_line(frame)
-        
-        # 2. 检测红色线
-        is_red, red_strength = detect_red_line(frame)
-        
-        # 3. 更新车辆控制
-        speed, steering = update_control(line_pos, red_strength)
-        
-        # 4. 红色区域启用二维码识别（避免频繁解码）
-        if in_red_zone and (time.time() - last_qr_time > 1):
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            qr_data = decode_qr_code(gray)
-            if qr_data:
-                print(f"[QR识别] 内容: {qr_data[0]}")
-                last_qr_time = time.time()
-        
-        # 5. 性能统计（可选）
-        process_time = (time.time() - t_start) * 1000
-        # print(f"处理耗时: {process_time:.1f}ms")
-        
-        # 按ESC键退出
-        if cv2.waitKey(1) == 27:
-            break
+        # 同时检查最小和最大有效面积
+        if area < VALID_AREA or area > MAX_VALID_AREA:
+            continue
 
-if __name__ == '__main__':
-    try:
-        main_loop()
-    except KeyboardInterrupt:
-        print("\n系统停止")
-    finally:
+        x, y, w_box, h_box = cv2.boundingRect(largest)
+        cx, cy = x + w_box // 2, y + h_box // 2 + y1
+        center_x += cx
+        valid_count += 1
+
+    if valid_count > 0:
+        center_x /= valid_count
+    return center_x
+
+def pid_control_angle(center_x, image_width):
+    """角度环PID控制"""
+    global integral_angle, previous_error_angle
+    setpoint = image_width / 2
+    error = setpoint - center_x
+
+    # 积分限幅
+    integral_max = 10000
+    integral_min = -10000
+    integral_angle += error
+    integral_angle = max(min(integral_angle, integral_max), integral_min)
+
+    # 计算微分项
+    derivative = error - previous_error_angle
+
+    # 计算PID输出
+    output = Kp_angle * error + Ki_angle * integral_angle + Kd_angle * derivative
+
+    # 输出限幅
+    output_max = 100.0
+    output_min = -100.0
+    output = max(min(output, output_max), output_min)
+
+    # 更新上一次误差
+    previous_error_angle = error
+
+    print(f"Angle PID: Error={error:.2f}, Integral={integral_angle:.2f}, Derivative={derivative:.2f}, Output={output:.2f}")
+
+    return output
+
+def pid_control_speed(target_speed, current_speed):
+    """速度环PID控制"""
+    global integral_speed, previous_error_speed
+    error = target_speed - current_speed
+
+    # 积分限幅
+    integral_max = 400
+    integral_min = -400
+    integral_speed += error
+    integral_speed = max(min(integral_speed, integral_max), integral_min)
+
+    # 计算微分项
+    derivative = error - previous_error_speed
+
+    # 计算PID输出
+    output = Kp_speed * error + Ki_speed * integral_speed + Kd_speed * derivative
+
+    # 输出限幅
+    output_max = 0.5  # 速度调整范围
+    output_min = -0.5
+    output = max(min(output, output_max), output_min)
+
+    # 更新上一次误差
+    previous_error_speed = error
+
+    print(f"Speed PID: Error={error:.2f}, Integral={integral_speed:.2f}, Derivative={derivative:.2f}, Output={output:.2f}")
+
+    return output
+
+def cleanup(ser):
+    """清理资源并重置系统状态"""
+    global integral_angle, previous_error_angle, integral_speed, previous_error_speed
+    
+    # 发送停止指令
+    print("发送停止指令...")
+    frame_to_send = build_frame(0, 0, 0)
+    ser.write(frame_to_send)
+    
+    # 释放摄像头资源
+    if cap is not None and cap.isOpened():
+        print("释放摄像头资源...")
         cap.release()
-        executor.shutdown(wait=False)
+    
+    # 重置PID控制参数
+    print("重置PID控制参数...")
+    integral_angle = 0
+    previous_error_angle = 0
+    integral_speed = 0
+    previous_error_speed = 0
+    
+    print("系统已完全重置")
+
+def detect_qr_code(frame):
+    """检测二维码"""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    decoded_objects = pyzbar.decode(gray)
+    return len(decoded_objects) > 0
+
+def main(port: str, baudrate: int, vx_base: float, rate_hz: float = 50.0, timeout: float = 1.0) -> None:
+    period = 1.0 / rate_hz  # 控制周期
+
+    # 初始化摄像头
+    camera = initialize_camera()
+
+    # 初始化当前速度（假设初始为0）
+    current_speed = 0.0
+
+    # 记录上一次检测到车道线时的状态
+    last_valid_vx = 0.0
+    last_valid_vz = 0.0
+    # 记录连续丢线次数
+    lost_line_count = 0
+    # 最大连续丢线尝试次数
+    MAX_LOST_LINE_TRIES = 10  
+
+    with serial.Serial(port, baudrate, timeout=timeout) as ser:
+        print(f'已打开 {port}，波特率 {baudrate}，发送频率 {rate_hz} Hz')
+        try:
+            while True:
+                ok, frame = camera.read()
+                if not ok:
+                    continue
+
+                # 检测二维码
+                if detect_qr_code(frame):
+                    print("检测到二维码，停车")
+                    frame_to_send = build_frame(0, 0, 0)
+                    ser.write(frame_to_send)
+                    break
+
+                center_x = detect_lane(frame)
+
+                if center_x != 0:
+                    # 检测到车道线，更新状态
+                    lost_line_count = 0
+                    # 角度环PID控制
+                    vz = pid_control_angle(center_x, frame.shape[1])
+
+                    # 计算角度绝对值（用于速度调节）
+                    angle_abs = abs(vz)
+
+                    # 根据角度调整目标速度（弯道减速，直道加速）
+                    if angle_abs > ANGLE_THRESHOLD:
+                        # 弯道减速
+                        slow_factor = 1.0 - min(1.0, angle_abs / 2.0)  # 最大减速到0
+                        target_speed = vx_base * slow_factor
+                        target_speed = max(target_speed, MIN_SPEED)  # 确保不低于最小速度
+                    else:
+                        # 直道加速（但不超过最大速度）
+                        target_speed = min(vx_base, MAX_SPEED)
+
+                    # 速度环PID控制
+                    speed_output = pid_control_speed(target_speed, current_speed)
+
+                    # 最终速度 = 基础速度 + PID调整值
+                    vx = target_speed + speed_output
+                    vx = max(MIN_SPEED, min(MAX_SPEED, vx))  # 确保速度在合理范围内
+
+                    # 更新上一次有效状态
+                    last_valid_vx = vx
+                    last_valid_vz = vz
+
+                else:
+                    lost_line_count += 1
+                    if lost_line_count <= MAX_LOST_LINE_TRIES:
+                        print("未检测到车道线，以最大角速度回线。")
+                        time.sleep(0.1)  # 等待一段时间后再尝试回线
+                        # 使用最后一次检测到的车道线位置来确定回线方向
+                        if last_valid_vz != 0:
+                            # 保持最后角速度方向，但使用最大角速度
+                            vz = MAX_ANGULAR_SPEED if last_valid_vz > 0 else -MAX_ANGULAR_SPEED
+                        else:
+                            # 如果之前没有有效角速度信息，默认向右转
+                            vz = MAX_ANGULAR_SPEED
+                        # 丢线时降低前进速度
+                        vx = MIN_SPEED
+                    else:
+                        print("多次尝试回线失败，继续沿上一状态行驶。")
+                        vx = last_valid_vx
+                        vz = last_valid_vz
+
+                print(f"vx_base={vx_base:.2f}, target_speed={target_speed:.2f}, vx={vx:.2f}, vz={vz:.2f}")
+
+                # 发送速度帧
+                frame_to_send = build_frame(vx, 0, vz)
+                ser.write(frame_to_send)
+
+                # 更新当前速度（实际应用中应通过编码器等传感器获取）
+                current_speed = vx  # 简化处理，实际应读取传感器
+
+                time.sleep(period)
+        except KeyboardInterrupt:
+            print('\n中断，正在清理资源...')
+            cleanup(ser)
+        except Exception as e:
+            print(f"发生错误: {e}")
+            cleanup(ser)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='基于PID控制的巡线')
+    parser.add_argument('--port', default='/dev/ttyCH343USB0', help='串口号 (如 COM7 或 /dev/ttyUSB0)')
+    parser.add_argument('--baudrate', type=int, default=115200, help='波特率')
+    parser.add_argument('--vx', type=float, default=0.05, help='基础前进速度 (m/s)')
+    args = parser.parse_args()
+
+    main(args.port, args.baudrate, args.vx)

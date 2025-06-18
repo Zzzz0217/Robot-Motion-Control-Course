@@ -10,14 +10,14 @@ FRAME_HEADER = 0x7B
 FRAME_TAIL = 0x7D
 
 # 角度环 PID 参数
-Kp_angle = 0.0025
+Kp_angle = 0.0028
 Ki_angle = 0.00005
-Kd_angle = 0.00005
+Kd_angle = 0.0007
 
 # 速度环 PID 参数
 Kp_speed = 0.0025  # 速度比例系数
 Ki_speed = 0.00005  # 速度积分系数
-Kd_speed = 0.000005  # 速度微分系数
+Kd_speed = 0.00005  # 速度微分系数
 
 # 积分和上一次误差
 integral_angle = 0
@@ -45,10 +45,10 @@ TARGET_FPS = 30
 JPEG_QUALITY = 70
 
 # ───────── 车道线算法参数 ─────────
-ROI_RATIO = 0.6   # 0.5 = 下半幅
-NUM_SLICES = 5
-VALID_AREA = 1500      # 最小有效面积
-MAX_VALID_AREA = 50000  # 新增：最大有效面积
+ROI_RATIO = 0.7   # 0.5 = 下半幅
+NUM_SLICES = 6
+VALID_AREA = 1000      # 最小有效面积
+MAX_VALID_AREA = 15000  # 新增：最大有效面积
 HSV_LOWER = np.array([0, 0, 0], np.uint8)
 HSV_UPPER = np.array([180, 255, 60], np.uint8)
 KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -58,7 +58,7 @@ THICK_LINE, POINT_R = 2, 6
 
 # ───────── 速度环控制参数 ─────────
 MAX_SPEED = 0.6  # 最大速度 (m/s)
-MIN_SPEED = 0.35  # 最小速度 (m/s)
+MIN_SPEED = 0.4  # 最小速度 (m/s)
 ANGLE_THRESHOLD = 0.5  # 角度阈值，用于速度调节
 
 # ───────── 初始化摄像头 ─────────
@@ -245,7 +245,7 @@ def main(port: str, baudrate: int, vx_base: float, rate_hz: float = 50.0, timeou
                     angle_abs = abs(vz)
 
                     # 根据角度调整目标速度（弯道减速，直道加速）
-                    target_speed = vx_base
+                    # target_speed = vx_base
                     if angle_abs > ANGLE_THRESHOLD:
                         # 弯道减速
                         slow_factor = 1.0 - min(1.0, angle_abs / 2.0)  # 最大减速到0
@@ -270,6 +270,7 @@ def main(port: str, baudrate: int, vx_base: float, rate_hz: float = 50.0, timeou
                     lost_line_count += 1
                     if lost_line_count <= MAX_LOST_LINE_TRIES:
                         print("未检测到车道线，以最大角速度回线。")
+                        time.sleep(0.1)  # 等待一段时间后再尝试回线
                         # 使用最后一次检测到的车道线位置来确定回线方向
                         if last_valid_vz != 0:
                             # 保持最后角速度方向，但使用最大角速度
@@ -305,7 +306,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='基于PID控制的巡线')
     parser.add_argument('--port', default='/dev/ttyACM0', help='串口号 (如 COM7 或 /dev/ttyUSB0)')
     parser.add_argument('--baudrate', type=int, default=115200, help='波特率')
-    parser.add_argument('--vx', type=float, default=0.45, help='基础前进速度 (m/s)')
+    parser.add_argument('--vx', type=float, default=0.65, help='基础前进速度 (m/s)')
     args = parser.parse_args()
 
     main(args.port, args.baudrate, args.vx)
