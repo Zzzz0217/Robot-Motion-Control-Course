@@ -172,8 +172,7 @@ FRAME_TAIL   = 0x7D
 
 # ───────── PID 控制器 （角度单位：度） ─────────
 class PIDController:
-    def __init__(self, kp: float, ki: float, kd: float, dt: float, name: str = "PID", 
-                 max_integral=100.0, min_output=None, max_output=None):
+    def __init__(self, kp: float, ki: float, kd: float, dt: float, name: str = "PID"):
         self.kp = kp
         self.ki = ki
         self.kd = kd
@@ -181,116 +180,40 @@ class PIDController:
         self.integral = 0.0
         self.prev_error = 0.0
         self.name = name
-        self.max_integral = max_integral  # 积分限幅，防止积分饱和
-        self.min_output = min_output      # 输出限幅下限
-        self.max_output = max_output      # 输出限幅上限
-        self.history = []                 # 保存最近的误差，用于检测异常和滤波
-        self.history_size = 5             # 历史记录长度
         debug(f"初始化 {self.name} 控制器: Kp={kp}, Ki={ki}, Kd={kd}, dt={dt}", "pid")
 
     def reset(self):
         self.integral = 0.0
         self.prev_error = 0.0
-        self.history = []
         debug(f"{self.name} 控制器已重置", "pid")
 
     def compute(self, error: float) -> float:
-        # 异常值检测：如果误差突变过大，可能是传感器或计算错误
-        if len(self.history) > 0:
-            avg_error = sum(self.history) / len(self.history)
-            if abs(error - avg_error) > 20.0 and abs(error) > 10.0:  # 异常检测阈值
-                debug(f"{self.name} 检测到异常误差: {error:.4f} vs 平均 {avg_error:.4f}, 使用平滑值", "pid")
-                error = (error + avg_error) / 2.0  # 使用平滑值减少突变
-
-        # 更新历史记录
-        self.history.append(error)
-        if len(self.history) > self.history_size:
-            self.history.pop(0)
-
-        # 计算比例项
         p_term = self.kp * error
-
-        # 计算积分项，添加积分限幅防止饱和
         self.integral += error * self.dt
-        if self.max_integral is not None:
-            if self.integral > self.max_integral:
-                self.integral = self.max_integral
-            elif self.integral < -self.max_integral:
-                self.integral = -self.max_integral
         i_term = self.ki * self.integral
-
-        # 计算微分项，添加平滑处理防止噪声放大
-        if len(self.history) > 1:
-            # 使用最近几个误差计算平均微分，减少噪声影响
-            derivative_sum = 0
-            for i in range(1, min(len(self.history), 3)):
-                derivative_sum += (self.history[-1] - self.history[-1-i]) / (i * self.dt)
-            derivative = derivative_sum / min(len(self.history)-1, 2)
-        else:
-            derivative = (error - self.prev_error) / self.dt
-
+        derivative = (error - self.prev_error) / self.dt
         d_term = self.kd * derivative
         self.prev_error = error
-
-        # 计算输出并应用限幅
         output = p_term + i_term + d_term
-
-        if self.min_output is not None and output < self.min_output:
-            output = self.min_output
-            debug(f"{self.name} 输出限幅(下限): {output:.4f}", "pid")
-        if self.max_output is not None and output > self.max_output:
-            output = self.max_output
-            debug(f"{self.name} 输出限幅(上限): {output:.4f}", "pid")
-
         debug(f"{self.name} 计算: error={error:.4f}, P={p_term:.4f}, I={i_term:.4f}, D={d_term:.4f}, 输出={output:.4f}", "pid")
         return output
 
 # ───────── 构造并发送 串口 帧 ─────────
 def build_frame(vx: float, vy: float, vz: float) -> bytes:
-    # 参数安全检查和限制
-    try:
-        import math
-        # 确保输入是有效的浮点数
-        if not all(isinstance(val, (int, float)) for val in [vx, vy, vz]):
-            debug(f"警告: 非数值类型输入, 使用默认值0.0替代", "serial")
-            vx, vy, vz = 0.0, 0.0, 0.0
-
-        # 处理NaN或Inf值
-        if any(math.isnan(val) or math.isinf(val) for val in [vx, vy, vz]):
-            debug(f"警告: 检测到NaN或Inf值, 使用默认值0.0替代", "serial")
-            vx = 0.0 if math.isnan(vx) or math.isinf(vx) else vx
-            vy = 0.0 if math.isnan(vy) or math.isinf(vy) else vy
-            vz = 0.0 if math.isnan(vz) or math.isinf(vz) else vz
-
-        # 构建帧
-        frame = bytearray()
-        frame.append(FRAME_HEADER)
-        frame += struct.pack('<f', float(vx))
-        frame += struct.pack('<f', float(vy))
-        frame += struct.pack('<f', float(vz))
-        frame.append(FRAME_TAIL)
-        debug(f"构建帧: vx={vx:.4f}, vy={vy:.4f}, vz={vz:.4f}", "serial")
-        return bytes(frame)
-    except Exception as e:
-        debug(f"构建帧异常: {e}, 返回零速度帧", "serial")
-        # 出现异常时返回零速度帧
-        frame = bytearray()
-        frame.append(FRAME_HEADER)
-        frame += struct.pack('<f', 0.0)
-        frame += struct.pack('<f', 0.0)
-        frame += struct.pack('<f', 0.0)
-        frame.append(FRAME_TAIL)
-        return bytes(frame)
+    frame = bytearray()
+    frame.append(FRAME_HEADER)
+    frame += struct.pack('<f', vx)
+    frame += struct.pack('<f', vy)
+    frame += struct.pack('<f', vz)
+    frame.append(FRAME_TAIL)
+    debug(f"构建帧: vx={vx:.4f}, vy={vy:.4f}, vz={vz:.4f}", "serial")
+    return bytes(frame)
 
 # ───────── 全局 资源 ─────────
 cap = None
 ser = None
 pid = None
 red_pid = None
-ERROR_COUNT = 0  # 错误计数
-MAX_RETRIES = 3  # 最大重试次数
-RECONNECT_DELAY = 2.0  # 重连延迟时间(秒)
-ERROR_THRESHOLD = 10  # 错误阈值
 
 # 固定线速度、最大角速度
 VX_CONST = 0.5   # m/s
@@ -301,61 +224,26 @@ RED_VX_CONST = 0.2
 RED_MAX_VZ = 2.0
 
 # ───────── 初始化 摄像头 ─────────
-def init_camera(device: int, width: int, height: int, fps: int, retries=MAX_RETRIES):
+def init_camera(device: int, width: int, height: int, fps: int):
     global cap
     debug(f"尝试初始化摄像头 {device} (分辨率: {width}×{height}, FPS: {fps})", "frame")
-
-    for attempt in range(retries):
-        try:
-            # 如果摄像头已存在，先释放资源
-            if cap is not None:
-                try:
-                    cap.release()
-                except:
-                    pass
-
-            cap = cv2.VideoCapture(device)
-            if not cap.isOpened():
-                raise RuntimeError(f"无法打开摄像头 {device}")
-
-            # 兼容不同OpenCV版本的MJPG设置
-            # OpenCV 3.x/4.x: VideoWriter_fourcc 可能在cv2或cv2.VideoWriter中
-            try:
-                if hasattr(cv2, 'VideoWriter_fourcc'):
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
-                elif hasattr(cv2, 'cv') and hasattr(cv2.cv, 'CV_FOURCC'):
-                    cap.set(cv2.CAP_PROP_FOURCC, cv2.cv.CV_FOURCC('M','J','P','G'))
-            except Exception as e:
-                print(f"{COLOR_YELLOW}[WARNING] 设置MJPG格式失败: {e}, 使用默认格式{COLOR_RESET}")
-
-            # 设置属性
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            cap.set(cv2.CAP_PROP_FPS, fps)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-            # 验证设置是否生效
-            actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            actual_fps = cap.get(cv2.CAP_PROP_FPS)
-
-            # 读取一帧测试摄像头是否真正工作
-            test_ret, test_frame = cap.read()
-            if not test_ret or test_frame is None:
-                raise RuntimeError("摄像头无法读取图像")
-
-            debug(f"摄像头初始化成功: 实际分辨率 {actual_width}×{actual_height}, FPS {actual_fps}", "frame")
-            return True
-
-        except Exception as e:
-            print(f"{COLOR_YELLOW}[WARNING] 摄像头初始化尝试 {attempt+1}/{retries} 失败: {e}{COLOR_RESET}")
-            if attempt < retries - 1:
-                print(f"{COLOR_YELLOW}[WARNING] {RECONNECT_DELAY}秒后重试...{COLOR_RESET}")
-                time.sleep(RECONNECT_DELAY)
-            else:
-                print(f"{COLOR_RED}[ERROR] 摄像头初始化失败，已达到最大尝试次数{COLOR_RESET}")
-                return False
-    return False
+    cap = cv2.VideoCapture(device)
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开摄像头 {device}")
+    # 兼容不同OpenCV版本的MJPG设置
+    # OpenCV 3.x/4.x: VideoWriter_fourcc 可能在cv2或cv2.VideoWriter中
+    if hasattr(cv2, 'VideoWriter_fourcc'):
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+    elif hasattr(cv2, 'cv') and hasattr(cv2.cv, 'CV_FOURCC'):
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.cv.CV_FOURCC('M','J','P','G'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    debug(f"摄像头初始化成功: 实际分辨率 {actual_width}×{actual_height}, FPS {actual_fps}", "frame")
 
 # ───────── 车道线检测 + 角度误差 计算 ─────────
 def compute_angle_error(frame: np.ndarray, roi_ratio, num_slices, valid_area, max_area, hsv_lower, hsv_upper, kernel, color_name: str) -> tuple[float, int]:
@@ -405,19 +293,15 @@ def compute_angle_error(frame: np.ndarray, roi_ratio, num_slices, valid_area, ma
 # ───────── 退出时 发送零速度 并 清理 ─────────
 def send_zero_and_cleanup():
     global ser, cap
-    # 尝试多次发送零速度命令
-    for i in range(3):
-        try:
-            if ser is not None and ser.is_open:
-                debug(f"发送零速度帧 (尝试 {i+1}/3)...", "serial")
-                zero_frame = build_frame(0.0, 0.0, 0.0)
-                ser.write(zero_frame)
-                time.sleep(0.1)
-                debug("零速度帧发送成功", "serial")
-        except Exception as e:
-            print(f"{COLOR_YELLOW}[WARNING] 发送零速度帧失败: {e}{COLOR_RESET}")
-
-    # 清理摄像头资源
+    try:
+        if ser is not None and ser.is_open:
+            debug("发送零速度帧...", "serial")
+            zero_frame = build_frame(0.0, 0.0, 0.0)
+            ser.write(zero_frame)
+            time.sleep(0.05)
+            debug("零速度帧发送成功", "serial")
+    except Exception as e:
+        print(f"{COLOR_YELLOW}[WARNING] 发送零速度帧失败: {e}{COLOR_RESET}")
     try:
         if cap is not None:
             debug("释放摄像头资源...", "frame")
@@ -425,15 +309,6 @@ def send_zero_and_cleanup():
             debug("摄像头资源已释放", "frame")
     except Exception as e:
         print(f"{COLOR_YELLOW}[WARNING] 释放摄像头失败: {e}{COLOR_RESET}")
-        try:
-            # 第二次尝试
-            time.sleep(0.5)
-            if cap is not None:
-                cap.release()
-        except:
-            pass
-
-    # 清理串口资源
     try:
         if ser is not None and ser.is_open:
             debug("关闭串口...", "serial")
@@ -441,15 +316,6 @@ def send_zero_and_cleanup():
             debug("串口已关闭", "serial")
     except Exception as e:
         print(f"{COLOR_YELLOW}[WARNING] 关闭串口失败: {e}{COLOR_RESET}")
-        try:
-            # 第二次尝试
-            time.sleep(0.5)
-            if ser is not None and ser.is_open:
-                ser.close()
-        except:
-            pass
-
-    print(f"{COLOR_GREEN}[INFO] 资源清理完成{COLOR_RESET}")
 
 def signal_handler(sig, frame):
     print(f"\n{COLOR_YELLOW}接收到终止信号 {sig}, 正在清理资源...{COLOR_RESET}")
@@ -677,27 +543,9 @@ def main():
                 print(f"{COLOR_YELLOW}[WARNING] 摄像头未初始化{COLOR_RESET}")
                 time.sleep(0.1)
                 continue
-            try:
-                ok, frame = cap.read() if hasattr(cap, 'read') else (False, None)
-                if not ok or frame is None:
-                    print(f"{COLOR_YELLOW}[WARNING] 读取帧失败，跳过当前帧{COLOR_RESET}")
-                    ERROR_COUNT += 1
-
-                    # 如果连续多次读取失败，尝试重新初始化摄像头
-                    if ERROR_COUNT > ERROR_THRESHOLD:
-                        print(f"{COLOR_YELLOW}[WARNING] 连续多次读取失败，尝试重新初始化摄像头{COLOR_RESET}")
-                        init_camera(args.cam_device, args.cam_width, args.cam_height, args.cam_fps)
-                        ERROR_COUNT = 0
-
-                    time.sleep(0.1)
-                    continue
-                else:
-                    # 读取成功，重置错误计数
-                    ERROR_COUNT = max(0, ERROR_COUNT - 1)
-            except Exception as e:
-                print(f"{COLOR_YELLOW}[WARNING] 读取帧异常: {e}, 跳过当前帧{COLOR_RESET}")
-                ERROR_COUNT += 1
-                time.sleep(0.1)
+            ok, frame = cap.read() if hasattr(cap, 'read') else (False, None)
+            if not ok or frame is None:
+                print(f"{COLOR_YELLOW}[WARNING] 读取帧失败，跳过当前帧{COLOR_RESET}")
                 continue
                 
             if not CAR_RUNNING:
@@ -762,48 +610,13 @@ def main():
                   f"线速度 {COLOR_RED}{send_vx:+.2f} m/s{COLOR_RESET}   "
                   f"角速度 {COLOR_BLUE}{send_vz:+.2f} °/s{COLOR_RESET}", end='')
             vy = 0.0
-            # 安全发送控制指令
-            if ser is not None:
+            if ser is not None and ser.is_open:
                 try:
                     frame_to_send = build_frame(send_vx, vy, send_vz)
-
-                    # 检查串口状态
-                    if not ser.is_open:
-                        print(f"{COLOR_YELLOW}[WARNING] 串口未打开，尝试重新打开{COLOR_RESET}")
-                        try:
-                            ser.open()
-                            time.sleep(0.1)
-                        except Exception as e:
-                            print(f"{COLOR_RED}[ERROR] 无法重新打开串口: {e}{COLOR_RESET}")
-
-                    if ser.is_open:
-                        # 使用安全发送函数，如果未定义则使用直接发送
-                        success = False
-                        try:
-                            if 'send_serial_frame' in globals():
-                                success = send_serial_frame(ser, frame_to_send)
-                            else:
-                                ser.write(frame_to_send)
-                                success = True
-                        except Exception as e:
-                            print(f"{COLOR_RED}[ERROR] 串口发送异常: {e}{COLOR_RESET}")
-                            ERROR_COUNT += 1
-
-                        if success:
-                            debug("控制帧已成功发送", "serial")
-                            ERROR_COUNT = max(0, ERROR_COUNT - 1)  # 成功则减少错误计数
-                        elif ERROR_COUNT > ERROR_THRESHOLD:
-                            # 连续错误过多，尝试复位通信
-                            print(f"{COLOR_YELLOW}[WARNING] 串口通信多次失败，尝试重置连接{COLOR_RESET}")
-                            try:
-                                ser.close()
-                                time.sleep(RECONNECT_DELAY)
-                                ser.open()
-                                ERROR_COUNT = 0
-                            except Exception as e:
-                                print(f"{COLOR_RED}[ERROR] 重置串口连接失败: {e}{COLOR_RESET}")
+                    ser.write(frame_to_send)
+                    debug("控制帧已发送", "serial")
                 except Exception as e:
-                    print(f"{COLOR_RED}[ERROR] 串口通信处理异常: {e}{COLOR_RESET}")
+                    print(f"{COLOR_RED}[ERROR] 串口发送异常: {e}{COLOR_RESET}")
             # 更新 Web 状态
             STATS["status"] = detection_status
             STATS["qr"] = qr_content if qr_detected else ""

@@ -147,7 +147,7 @@ RED_MAX_VZ = 2.0
 def init_camera(device: int, width: int, height: int, fps: int):
     global cap
     debug(f"尝试初始化摄像头 {device} (分辨率: {width}×{height}, FPS: {fps})", "frame")
-    cap = cv2.VideoCapture(device, cv2.V4L2)
+    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
         raise RuntimeError(f"无法打开摄像头 {device}")
     
