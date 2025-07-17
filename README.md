@@ -1,4 +1,3 @@
-```plaintext
 # Robot-Motion-Control-Course
 
 ## 项目概述
@@ -111,4 +110,3 @@ Robot-Motion-Control-Course/
 版权所有 (c) 2025 Jason 钟晔
 
 如有任何问题或建议，请随时联系作者。
-```
